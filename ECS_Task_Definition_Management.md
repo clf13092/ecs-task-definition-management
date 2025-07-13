@@ -21,9 +21,10 @@ GitHub Reusable Workflowsを活用し、インフラチームによる統制と�
 - ✅ インフラ側でCPU/メモリなどのリソース制限を統制
 - ✅ GitHub Workflowsの書き方をインフラ側で統制
 - ✅ 30個程度のマイクロサービスリポジトリに対応
+- ✅ プライベートリポジトリ間でのワークフロー連携
 
 ### 非機能要件
-- 🔒 セキュアな認証（GitHub Apps）
+- 🔒 セキュアな認証（GitHub Apps + AWS OIDC）
 - 🚀 スケーラブルな運用
 - 🔧 メンテナンス性の確保
 
@@ -40,7 +41,7 @@ graph TB
         BRN[Business Repo N<br/>...]
     end
     
-    subgraph "Infrastructure Repository"
+    subgraph "Infrastructure Repository (Private)"
         IR[Infrastructure Repo<br/>Central Management]
         RW[Reusable Workflows<br/>deploy-ecs-task-definition.yml]
         TT[Task Definition<br/>Templates]
@@ -53,14 +54,14 @@ graph TB
         CD[CD Process<br/>Deployment]
     end
     
-    BR1 -->|calls| RW
-    BR2 -->|calls| RW
-    BR3 -->|calls| RW
-    BRN -->|calls| RW
+    BR1 -->|GitHub Apps API| RW
+    BR2 -->|GitHub Apps API| RW
+    BR3 -->|GitHub Apps API| RW
+    BRN -->|GitHub Apps API| RW
     
     RW --> TT
     RW --> VS
-    RW -->|uploads| S3
+    RW -->|OIDC Auth| S3
     
     CD -->|reads| S3
     CD -->|deploys| ECS
@@ -76,21 +77,23 @@ graph TB
 ```mermaid
 sequenceDiagram
     participant BS as Business Service
-    participant GH as GitHub
+    participant GH as GitHub Apps
     participant IR as Infrastructure Repo
     participant VS as Validation
     participant S3 as S3 Bucket
     participant CD as CD Process
     participant ECS as ECS
     
-    BS->>GH: 1. Push code changes
-    GH->>IR: 2. Call Reusable Workflow
-    IR->>VS: 3. Validate parameters
-    VS-->>IR: 4. Validation result
-    IR->>IR: 5. Generate task definition
-    IR->>S3: 6. Upload task definition
-    CD->>S3: 7. Read task definition
-    CD->>ECS: 8. Update service
+    BS->>GH: 1. Generate App Token
+    GH-->>BS: 2. Return access token
+    BS->>BS: 3. Read params file
+    BS->>IR: 4. Call workflow via API
+    IR->>VS: 5. Validate parameters
+    VS-->>IR: 6. Validation result
+    IR->>IR: 7. Generate task definition
+    IR->>S3: 8. Upload task definition (OIDC)
+    CD->>S3: 9. Read task definition
+    CD->>ECS: 10. Update service
 ```
 
 ## ファイル構成
@@ -98,29 +101,25 @@ sequenceDiagram
 ### インフラリポジトリ構成
 
 ```
-infrastructure-repo/
+infra_repository/ (Private)
 ├── 📁 .github/workflows/
 │   └── 📄 deploy-ecs-task-definition.yml    # Reusable Workflow
 ├── 📁 templates/
-│   ├── 📄 task-definition-template.json     # ECSタスク定義テンプレート
-│   └── 📄 service-template.json             # サービス設定テンプレート
+│   └── 📄 task-definition-template.json     # ECSタスク定義テンプレート
 ├── 📁 validation/
-│   ├── 📄 validate-params.sh                # パラメータバリデーション
-│   ├── 📄 validate-resources.sh             # リソース制限チェック
-│   └── 📄 security-check.sh                 # セキュリティチェック
+│   └── 📄 validate-params.sh                # パラメータバリデーション
 ├── 📁 scripts/
-│   ├── 📄 template-processor.sh             # テンプレート処理
-│   └── 📄 s3-uploader.sh                    # S3アップロード
+│   └── 📄 template-processor.sh             # テンプレート処理
 └── 📄 README.md                             # 運用ドキュメント
 ```
 
 ### 業務リポジトリ構成
 
 ```
-business-app-repo/
+app_repository/
 ├── 📁 .github/workflows/
-│   └── 📄 deploy.yml                        # Reusable Workflowを呼び出し
-├── 📄 ecs-params.json                       # 業務側パラメータ
+│   └── 📄 deploy.yml                        # GitHub Apps API でワークフロー呼び出し
+├── 📄 ecs-params.json                       # 業務側パラメータ（シンプル化）
 ├── 📄 src/                                  # アプリケーションコード
 └── 📄 README.md                             # サービス固有ドキュメント
 ```
@@ -136,19 +135,17 @@ graph LR
         
         subgraph "Required Permissions"
             P1[📖 contents: read]
-            P2[⚡ actions: read]
+            P2[⚡ actions: write]
             P3[📊 metadata: read]
-            P4[🔄 pull-requests: write]
         end
         
         GA --> P1
         GA --> P2
         GA --> P3
-        GA --> P4
     end
     
     subgraph "Repository Access"
-        IR[Infrastructure Repo]
+        IR[Infrastructure Repo<br/>(Private)]
         BR[Business Repos]
     end
     
@@ -159,26 +156,24 @@ graph LR
     style P1 fill:#4caf50
     style P2 fill:#2196f3
     style P3 fill:#9c27b0
-    style P4 fill:#f44336
 ```
 
-### 認証フロー図
+### AWS OIDC認証フロー図
 
 ```mermaid
 sequenceDiagram
-    participant BR as Business Repo
-    participant GA as GitHub Apps
     participant IR as Infrastructure Repo
+    participant OIDC as GitHub OIDC Provider
+    participant AWS as AWS STS
     participant S3 as S3 Bucket
     
-    Note over BR,S3: Authentication Flow
+    Note over IR,S3: AWS OIDC Authentication Flow
     
-    BR->>GA: 1. Request token with APP_ID
-    GA->>GA: 2. Validate private key
-    GA-->>BR: 3. Return access token
-    BR->>IR: 4. Call reusable workflow
-    Note over IR: 5. Process with token
-    IR->>S3: 6. Upload with AWS credentials
+    IR->>OIDC: 1. Request OIDC token
+    OIDC-->>IR: 2. Return ID token
+    IR->>AWS: 3. AssumeRoleWithWebIdentity
+    AWS-->>IR: 4. Return temporary credentials
+    IR->>S3: 5. Upload with temporary credentials
 ```
 
 ## セットアップ手順
@@ -195,19 +190,11 @@ flowchart TD
     GETID --> SECRETS{🔐 Secrets設定}
     SECRETS --> |APP_ID| S1[APP_ID]
     SECRETS --> |APP_PRIVATE_KEY| S2[APP_PRIVATE_KEY]
-    SECRETS --> |INSTALLATION_ID| S3[INSTALLATION_ID]
     
-    S1 --> VARS{📝 Variables設定}
-    S2 --> VARS
-    S3 --> VARS
+    S1 --> FILES{📄 ファイル配置}
+    S2 --> FILES
     
-    VARS --> |INFRASTRUCTURE_REPO| V1[INFRASTRUCTURE_REPO]
-    VARS --> |SERVICE_NAME| V2[SERVICE_NAME]
-    
-    V1 --> FILES{📄 ファイル配置}
-    V2 --> FILES
-    
-    FILES --> |Workflow| F1[deploy-ecs.yml]
+    FILES --> |Workflow| F1[deploy.yml]
     FILES --> |Parameters| F2[ecs-params.json]
     
     F1 --> TEST[🧪 動作テスト]
@@ -220,25 +207,34 @@ flowchart TD
     style START fill:#4caf50
     style SUCCESS fill:#4caf50
     style SECRETS fill:#ff9800
-    style VARS fill:#2196f3
     style FILES fill:#9c27b0
 ```
 
-### セットアップチェックリスト
+### AWS OIDC設定手順
 
-| ステップ | 項目 | 担当 | 状態 |
-|---------|------|------|------|
-| 1 | GitHub Apps インストール | インフラ | ⬜ |
-| 2 | INSTALLATION_ID 取得 | インフラ | ⬜ |
-| 3 | Repository Secrets 設定 | 業務 | ⬜ |
-| 4 | Repository Variables 設定 | 業務 | ⬜ |
-| 5 | Workflow ファイル配置 | 業務 | ⬜ |
-| 6 | パラメータファイル作成 | 業務 | ⬜ |
-| 7 | 動作テスト | 業務 | ⬜ |
+```mermaid
+flowchart TD
+    AWS_START([AWS OIDC設定開始]) --> PROVIDER[🔧 OIDC Provider作成]
+    
+    PROVIDER --> |URL| P1[token.actions.githubusercontent.com]
+    PROVIDER --> |Audience| P2[sts.amazonaws.com]
+    
+    P1 --> ROLE[🎭 IAMロール作成]
+    P2 --> ROLE
+    
+    ROLE --> TRUST[📝 信頼ポリシー設定]
+    TRUST --> POLICY[📋 権限ポリシー設定]
+    
+    POLICY --> SECRET[🔐 AWS_ROLE_ARNシークレット設定]
+    SECRET --> AWS_SUCCESS([✅ AWS設定完了])
+    
+    style AWS_START fill:#ff9800
+    style AWS_SUCCESS fill:#4caf50
+```
 
 ## 具体的な実装例
 
-### Reusable Workflow
+### Infrastructure Repository: Reusable Workflow
 
 ```yaml
 # .github/workflows/deploy-ecs-task-definition.yml
@@ -251,8 +247,8 @@ on:
         description: 'Service name'
         required: true
         type: string
-      params_file:
-        description: 'Parameters file path'
+      params_content:
+        description: 'Parameters file content as JSON string'
         required: true
         type: string
       environment:
@@ -260,128 +256,179 @@ on:
         required: false
         type: string
         default: 'production'
-    secrets:
-      app_id:
-        description: 'GitHub App ID'
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: 'Service name'
         required: true
-      app_private_key:
-        description: 'GitHub App Private Key'
+        type: string
+      params_content:
+        description: 'Parameters file content as JSON string'
         required: true
-      installation_id:
-        description: 'GitHub App Installation ID'
-        required: true
-      aws_access_key_id:
-        description: 'AWS Access Key ID'
-        required: true
-      aws_secret_access_key:
-        description: 'AWS Secret Access Key'
-        required: true
+        type: string
+      environment:
+        description: 'Deployment environment'
+        required: false
+        type: string
+        default: 'production'
 
 jobs:
   validate-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout Infrastructure Repo
         uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/infrastructure-repo
-          token: ${{ steps.app-token.outputs.token }}
       
-      - name: Generate App Token
-        id: app-token
-        uses: actions/create-github-app-token@v1
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          app-id: ${{ secrets.app_id }}
-          private-key: ${{ secrets.app_private_key }}
-          installation-id: ${{ secrets.installation_id }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-1
       
-      - name: Checkout Business Repo
-        uses: actions/checkout@v4
-        with:
-          path: business-repo
-          token: ${{ steps.app-token.outputs.token }}
+      - name: Create params file from input
+        run: |
+          echo '${{ inputs.params_content }}' > params.json
+      
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
       
       - name: Validate Parameters
         run: |
-          bash validation/validate-params.sh business-repo/${{ inputs.params_file }}
+          chmod +x ./validation/validate-params.sh
+          ./validation/validate-params.sh params.json
       
       - name: Generate Task Definition
         run: |
-          bash scripts/template-processor.sh \
+          chmod +x ./scripts/template-processor.sh
+          ./scripts/template-processor.sh \
             templates/task-definition-template.json \
-            business-repo/${{ inputs.params_file }} \
+            params.json \
             ${{ inputs.service_name }} \
             > task-definition.json
       
       - name: Upload to S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.aws_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.aws_secret_access_key }}
-          AWS_DEFAULT_REGION: ap-northeast-1
         run: |
           aws s3 cp task-definition.json \
-            s3://your-bucket/task-definitions/${{ inputs.service_name }}/task-definition.json
+            s3://github-taskdefinition-test/task-definitions/${{ inputs.service_name }}/task-definition.json
 ```
 
-### 業務リポジトリのWorkflow
+### Business Repository: Workflow
 
 ```yaml
-# .github/workflows/deploy-ecs.yml
+# .github/workflows/deploy.yml
 name: Deploy ECS Task Definition
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      service_name:
+        description: 'Service name'
+        required: true
+        type: string
+      params_file:
+        description: 'Parameters file path'
+        required: true
+        type: string
+        default: 'ecs-params.json'
+      environment:
+        description: 'Deployment environment'
+        required: false
+        type: string
+        default: 'production'
 
 jobs:
   deploy:
-    uses: your-org/infrastructure-repo/.github/workflows/deploy-ecs-task-definition.yml@main
-    with:
-      service_name: ${{ vars.SERVICE_NAME }}
-      params_file: ecs-params.json
-      environment: production
-    secrets:
-      app_id: ${{ secrets.APP_ID }}
-      app_private_key: ${{ secrets.APP_PRIVATE_KEY }}
-      installation_id: ${{ secrets.INSTALLATION_ID }}
-      aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: "app_repository,infra_repository"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      
+      - name: Read params file
+        id: params
+        run: |
+          content=$(cat ${{ inputs.params_file }})
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          echo "$content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Call infra workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const response = await github.rest.actions.createWorkflowDispatch({
+              owner: 'clf13092',
+              repo: 'infra_repository',
+              workflow_id: 'deploy-ecs-task-definition.yml',
+              ref: 'main',
+              inputs: {
+                service_name: '${{ inputs.service_name }}',
+                params_content: `${{ steps.params.outputs.content }}`,
+                environment: '${{ inputs.environment }}'
+              }
+            });
+            console.log('Workflow dispatched:', response.status);
 ```
 
-### パラメータファイル例
+### パラメータファイル例（シンプル化）
 
 ```json
 {
+  "image": "nginx:latest",
   "cpu": "256",
   "memory": "512",
-  "image_tag": "v1.2.3",
-  "port": 8080,
-  "environment_vars": [
+  "environment": "production"
+}
+```
+
+### Task Definition Template
+
+```json
+{
+  "family": "placeholder",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/ecsTaskRole",
+  "containerDefinitions": [
     {
-      "name": "ENV",
-      "value": "production"
-    },
-    {
-      "name": "LOG_LEVEL",
-      "value": "info"
-    },
-    {
-      "name": "DATABASE_URL",
-      "value": "postgresql://prod-db:5432/myapp"
+      "name": "placeholder",
+      "image": "nginx:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/placeholder",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
     }
-  ],
-  "health_check": {
-    "path": "/health",
-    "interval": 30,
-    "timeout": 5,
-    "retries": 3,
-    "start_period": 60
-  },
-  "resource_limits": {
-    "cpu_limit": "512",
-    "memory_limit": "1024"
-  }
+  ]
 }
 ```
 
@@ -391,44 +438,105 @@ jobs:
 #!/bin/bash
 # validation/validate-params.sh
 
-PARAMS_FILE=$1
+set -e
 
-# JSONファイルの存在確認
-if [[ ! -f "$PARAMS_FILE" ]]; then
-    echo "❌ ERROR: Parameters file not found: $PARAMS_FILE"
+PARAMS_FILE="$1"
+
+if [ -z "$PARAMS_FILE" ]; then
+    echo "Error: Parameters file path is required"
     exit 1
 fi
 
-# JSON形式の検証
+if [ ! -f "$PARAMS_FILE" ]; then
+    echo "Error: Parameters file not found: $PARAMS_FILE"
+    exit 1
+fi
+
+echo "Validating parameters file: $PARAMS_FILE"
+
 if ! jq empty "$PARAMS_FILE" 2>/dev/null; then
-    echo "❌ ERROR: Invalid JSON format in $PARAMS_FILE"
+    echo "Error: Invalid JSON format in parameters file"
     exit 1
 fi
 
-# CPUの制限チェック
-CPU=$(jq -r '.cpu' "$PARAMS_FILE")
-if [[ "$CPU" -gt 1024 ]]; then
-    echo "❌ ERROR: CPU exceeds limit (1024): $CPU"
-    exit 1
-fi
+REQUIRED_FIELDS=("image" "cpu" "memory")
 
-# メモリの制限チェック
-MEMORY=$(jq -r '.memory' "$PARAMS_FILE")
-if [[ "$MEMORY" -gt 2048 ]]; then
-    echo "❌ ERROR: Memory exceeds limit (2048MB): $MEMORY"
-    exit 1
-fi
-
-# 必須フィールドの確認
-REQUIRED_FIELDS=("cpu" "memory" "image_tag" "port")
 for field in "${REQUIRED_FIELDS[@]}"; do
-    if [[ $(jq -r ".$field" "$PARAMS_FILE") == "null" ]]; then
-        echo "❌ ERROR: Required field missing: $field"
+    if ! jq -e ".$field" "$PARAMS_FILE" > /dev/null; then
+        echo "Error: Required field '$field' is missing"
         exit 1
     fi
 done
 
-echo "✅ Validation passed for $PARAMS_FILE"
+CPU_VALUE=$(jq -r '.cpu' "$PARAMS_FILE")
+MEMORY_VALUE=$(jq -r '.memory' "$PARAMS_FILE")
+
+if [[ ! "$CPU_VALUE" =~ ^[0-9]+$ ]]; then
+    echo "Error: CPU value must be a number"
+    exit 1
+fi
+
+if [[ ! "$MEMORY_VALUE" =~ ^[0-9]+$ ]]; then
+    echo "Error: Memory value must be a number"
+    exit 1
+fi
+
+echo "Parameters validation passed successfully"
+```
+
+### Template Processor Script
+
+```bash
+#!/bin/bash
+# scripts/template-processor.sh
+
+set -e
+
+TEMPLATE_FILE="$1"
+PARAMS_FILE="$2"
+SERVICE_NAME="$3"
+
+if [ -z "$TEMPLATE_FILE" ] || [ -z "$PARAMS_FILE" ] || [ -z "$SERVICE_NAME" ]; then
+    echo "Usage: $0 <template_file> <params_file> <service_name>"
+    exit 1
+fi
+
+if [ ! -f "$TEMPLATE_FILE" ]; then
+    echo "Error: Template file not found: $TEMPLATE_FILE"
+    exit 1
+fi
+
+if [ ! -f "$PARAMS_FILE" ]; then
+    echo "Error: Parameters file not found: $PARAMS_FILE"
+    exit 1
+fi
+
+IMAGE=$(jq -r '.image' "$PARAMS_FILE")
+CPU=$(jq -r '.cpu' "$PARAMS_FILE")
+MEMORY=$(jq -r '.memory' "$PARAMS_FILE")
+ENVIRONMENT=$(jq -r '.environment // "production"' "$PARAMS_FILE")
+
+if [ "$IMAGE" = "null" ] || [ "$CPU" = "null" ] || [ "$MEMORY" = "null" ]; then
+    echo "Error: Required parameters (image, cpu, memory) are missing"
+    exit 1
+fi
+
+jq \
+  --arg service_name "$SERVICE_NAME" \
+  --arg image "$IMAGE" \
+  --arg cpu "$CPU" \
+  --arg memory "$MEMORY" \
+  --arg environment "$ENVIRONMENT" \
+  '
+  .family = $service_name |
+  .containerDefinitions[0].name = $service_name |
+  .containerDefinitions[0].image = $image |
+  .cpu = $cpu |
+  .memory = $memory |
+  .containerDefinitions[0].environment = [
+    {"name": "ENVIRONMENT", "value": $environment}
+  ]
+  ' "$TEMPLATE_FILE"
 ```
 
 ## 運用上の考慮事項
@@ -442,29 +550,71 @@ graph TD
         L2[🛡️ Repository Permissions]
         L3[✅ Parameter Validation]
         L4[🚨 Resource Limits]
-        L5[📋 Audit Logging]
+        L5[🔒 AWS OIDC Authentication]
+        L6[📋 Audit Logging]
     end
     
     L1 --> L2
     L2 --> L3
     L3 --> L4
     L4 --> L5
+    L5 --> L6
     
     style L1 fill:#f44336
     style L2 fill:#ff9800
     style L3 fill:#ffeb3b
     style L4 fill:#4caf50
     style L5 fill:#2196f3
+    style L6 fill:#9c27b0
 ```
 
 ### トラブルシューティング
 
 | 問題 | 原因 | 解決方法 |
 |------|------|---------|
-| Workflow実行エラー | 認証失敗 | INSTALLATION_IDの再確認 |
-| バリデーション失敗 | パラメータ不正 | ecs-params.jsonの形式確認 |
-| S3アップロード失敗 | AWS権限不足 | IAMポリシーの確認 |
-| テンプレート処理エラー | 必須パラメータ欠如 | パラメータファイルの補完 |
+| GitHub Apps認証エラー | 秘密鍵形式不正 | PEM形式の確認、改行の保持 |
+| GitHub Apps権限エラー | Actions: write権限不足 | GitHub Apps設定でActions: writeを付与 |
+| Workflow呼び出し失敗 | プライベートリポジトリアクセス不可 | GitHub Appsがinfra_repositoryにインストール済みか確認 |
+| バリデーション失敗 | パラメータ形式不正 | ecs-params.jsonの必須フィールド確認 |
+| AWS認証失敗 | OIDC設定不備 | IAMロールの信頼ポリシー確認 |
+| S3アップロード失敗 | 権限不足 | IAMロールのS3権限確認 |
+
+### 必要なSecrets設定
+
+#### Business Repository (app_repository)
+- `APP_ID`: GitHub App ID
+- `APP_PRIVATE_KEY`: GitHub App Private Key（PEM形式）
+
+#### Infrastructure Repository (infra_repository)
+- `AWS_ROLE_ARN`: AWS IAMロールARN（OIDC用）
+
+### AWS IAM設定例
+
+#### OIDC Provider設定
+- Provider URL: `token.actions.githubusercontent.com`
+- Audience: `sts.amazonaws.com`
+
+#### IAMロール信頼ポリシー例
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::YOUR_ACCOUNT:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:clf13092/infra_repository:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
 
 ### メンテナンス手順
 
@@ -488,11 +638,13 @@ graph TD
 - [GitHub Reusable Workflows](https://docs.github.com/en/actions/using-workflows/reusing-workflows)
 - [GitHub Apps](https://docs.github.com/en/developers/apps/getting-started-with-apps)
 - [ECS Task Definitions](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definitions.html)
+- [AWS OIDC with GitHub Actions](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
 
 ### 更新履歴
 | 日付 | バージョン | 変更内容 |
 |------|-----------|---------|
 | 2025-07-12 | 1.0.0 | 初版作成 |
+| 2025-07-13 | 1.1.0 | プライベートリポジトリ対応、OIDC認証対応、ワークフロー構造更新 |
 
 ---
 
